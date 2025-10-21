@@ -1,0 +1,12 @@
+# IP登录限制插件配置
+
+# 是否启用插件
+enabled: true
+
+# IP冷却时间(分钟)，0表示永久绑定
+time-limit: 1440
+
+# 绕过IP限制的地址列表
+bypass-ips:
+  - "127.0.0.1"
+  - "localhost"

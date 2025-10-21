@@ -1,0 +1,16 @@
+name: MC-LoginIPLimit
+version: '1.0'
+main: ljsure.cn.LoginIPLimit
+api-version: '1.20'
+load: STARTUP
+authors: [ Superbomb ]
+description: IP登录限制插件，支持Velocity代理
+commands:
+  ip:
+    description: IP限制管理命令
+    usage: /ip <enable|disable|timelimit|erase|bypass|unbypass|status|list>
+    permission: loginiplimit.admin
+permissions:
+  loginiplimit.admin:
+    description: 管理IP限制插件
+    default: op

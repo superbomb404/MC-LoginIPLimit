@@ -6,7 +6,7 @@
 
     <groupId>ljsure.cn.LoginIPLimit</groupId>
     <artifactId>MC-LoginIPLimit</artifactId>
-    <version>1.0</version>
+    <version>2.0</version>
     <packaging>jar</packaging>
 
     <name>MC-LoginIPLimit</name>

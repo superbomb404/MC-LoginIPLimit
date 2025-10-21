@@ -17,6 +17,7 @@ import org.bukkit.util.StringUtil;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.sql.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -24,10 +25,8 @@ import java.util.concurrent.TimeUnit;
 public class LoginIPLimit extends JavaPlugin implements Listener {
 
     private FileConfiguration config;
-    private FileConfiguration dataConfig;
-    private File dataFile;
+    private DatabaseManager databaseManager;
 
-    private Map<String, Long> ipCooldowns = new HashMap<>();
     private Set<String> bypassIPs = new HashSet<>();
     private SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
@@ -40,8 +39,13 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         saveDefaultConfig();
         config = getConfig();
 
-        // 加载数据文件
-        loadDataFile();
+        // 初始化数据库管理器
+        databaseManager = new DatabaseManager(this);
+        if (!databaseManager.initialize()) {
+            getLogger().severe("数据库初始化失败，插件将禁用!");
+            Bukkit.getPluginManager().disablePlugin(this);
+            return;
+        }
 
         // 注册事件
         getServer().getPluginManager().registerEvents(this, this);
@@ -57,56 +61,21 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         // 启动定时清理任务
         startCleanupTask();
 
-        getLogger().info("LoginIPLimit 插件已启用!");
+        getLogger().info("LoginIPLimit 插件已启用! 使用" + (config.getBoolean("mysql.enabled", false) ? "MySQL" : "YAML") + "存储");
     }
 
     @Override
     public void onDisable() {
-        saveData();
+        if (databaseManager != null) {
+            databaseManager.close();
+        }
         getLogger().info("LoginIPLimit 插件已禁用!");
-    }
-
-    private void loadDataFile() {
-        dataFile = new File(getDataFolder(), "data.yml");
-        if (!dataFile.exists()) {
-            dataFile.getParentFile().mkdirs();
-            saveResource("data.yml", false);
-        }
-        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-
-        // 加载IP冷却数据
-        if (dataConfig.contains("ip-cooldowns")) {
-            for (String ip : dataConfig.getConfigurationSection("ip-cooldowns").getKeys(false)) {
-                long endTime = dataConfig.getLong("ip-cooldowns." + ip);
-                ipCooldowns.put(ip, endTime);
-            }
-        }
-    }
-
-    private void saveData() {
-        try {
-            // 保存IP冷却数据
-            for (Map.Entry<String, Long> entry : ipCooldowns.entrySet()) {
-                dataConfig.set("ip-cooldowns." + entry.getKey(), entry.getValue());
-            }
-            dataConfig.save(dataFile);
-        } catch (IOException e) {
-            getLogger().severe("保存数据文件时出错: " + e.getMessage());
-        }
     }
 
     private void startCleanupTask() {
         // 每分钟清理一次过期的IP记录
         Bukkit.getScheduler().runTaskTimer(this, () -> {
-            long currentTime = System.currentTimeMillis();
-            ipCooldowns.entrySet().removeIf(entry -> {
-                if (entry.getValue() > 0 && entry.getValue() <= currentTime) {
-                    getLogger().info("IP " + entry.getKey() + " 的冷却时间已结束");
-                    return true;
-                }
-                return false;
-            });
-            saveData();
+            databaseManager.cleanupExpiredIPs();
         }, 0L, 20L * 60L); // 每分钟执行一次
     }
 
@@ -120,6 +89,7 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         InetAddress address = event.getAddress();
         String ip = address.getHostAddress();
         UUID playerUUID = player.getUniqueId();
+        String playerName = player.getName();
 
         // 检查是否在绕过列表中
         if (bypassIPs.contains(ip)) {
@@ -127,35 +97,27 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         }
 
         // 检查IP是否在冷却中
-        if (ipCooldowns.containsKey(ip)) {
-            long endTime = ipCooldowns.get(ip);
+        IPData ipData = databaseManager.getIPData(ip);
+        if (ipData != null) {
+            long endTime = ipData.getEndTime();
             long currentTime = System.currentTimeMillis();
 
             // 永久绑定或冷却时间内
             if (endTime == 0 || endTime > currentTime) {
-                // 检查是否有玩家数据记录
-                String storedUUID = dataConfig.getString("player-data." + ip + ".uuid");
-
-                if (storedUUID != null) {
-                    UUID storedPlayerUUID = UUID.fromString(storedUUID);
-
-                    // 如果尝试登录的玩家不是绑定的玩家
-                    if (!storedPlayerUUID.equals(playerUUID)) {
-                        String kickMessage;
-                        if (endTime == 0) {
-                            kickMessage = createPermanentKickMessage(ip, storedPlayerUUID);
-                        } else {
-                            kickMessage = createTemporaryKickMessage(ip, endTime, currentTime, storedPlayerUUID);
-                        }
-                        event.disallow(PlayerLoginEvent.Result.KICK_OTHER, kickMessage);
-                        return;
+                // 如果尝试登录的玩家不是绑定的玩家
+                if (!ipData.getPlayerUUID().equals(playerUUID)) {
+                    String kickMessage;
+                    if (endTime == 0) {
+                        kickMessage = createPermanentKickMessage(ip, ipData.getPlayerUUID(), ipData.getPlayerName());
+                    } else {
+                        kickMessage = createTemporaryKickMessage(ip, endTime, currentTime, ipData.getPlayerUUID(), ipData.getPlayerName());
                     }
+                    event.disallow(PlayerLoginEvent.Result.KICK_OTHER, kickMessage);
+                    return;
                 }
             } else {
                 // 冷却时间结束，移除记录
-                ipCooldowns.remove(ip);
-                dataConfig.set("player-data." + ip, null);
-                saveData();
+                databaseManager.removeIPData(ip);
             }
         }
 
@@ -163,13 +125,7 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         int timeLimit = config.getInt("time-limit", 10);
         long endTime = timeLimit == 0 ? 0 : System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(timeLimit);
 
-        ipCooldowns.put(ip, endTime);
-        dataConfig.set("player-data." + ip + ".uuid", playerUUID.toString());
-        dataConfig.set("player-data." + ip + ".ip", ip);
-        dataConfig.set("player-data." + ip + ".end-time", endTime);
-        dataConfig.set("player-data." + ip + ".player-name", player.getName());
-
-        saveData();
+        databaseManager.saveIPData(ip, playerUUID, playerName, endTime);
 
         if (timeLimit > 0) {
             player.sendMessage(ChatColor.GREEN + "您的IP将在 " + timeLimit + " 分钟后解除绑定");
@@ -178,8 +134,8 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         }
     }
 
-    private String createPermanentKickMessage(String ip, UUID boundPlayerUUID) {
-        String playerName = getPlayerName(boundPlayerUUID);
+    private String createPermanentKickMessage(String ip, UUID boundPlayerUUID, String boundPlayerName) {
+        String playerName = boundPlayerName != null ? boundPlayerName : getPlayerName(boundPlayerUUID);
 
         return ChatColor.translateAlternateColorCodes('&',
                 "&c&lIP登录限制\n" +
@@ -193,11 +149,11 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         );
     }
 
-    private String createTemporaryKickMessage(String ip, long endTime, long currentTime, UUID boundPlayerUUID) {
+    private String createTemporaryKickMessage(String ip, long endTime, long currentTime, UUID boundPlayerUUID, String boundPlayerName) {
         long remainingTime = endTime - currentTime;
         String timeLeft = formatTime(remainingTime);
-        String endTimeStr = dateFormat.format(new Date(endTime));
-        String playerName = getPlayerName(boundPlayerUUID);
+        String endTimeStr = dateFormat.format(new java.util.Date(endTime));
+        String playerName = boundPlayerName != null ? boundPlayerName : getPlayerName(boundPlayerUUID);
 
         return ChatColor.translateAlternateColorCodes('&',
                 "&c&lIP登录限制\n" +
@@ -214,24 +170,13 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
     }
 
     private String getPlayerName(UUID playerUUID) {
-        // 首先尝试从数据文件中获取存储的玩家名
-        for (String ip : dataConfig.getConfigurationSection("player-data").getKeys(false)) {
-            String storedUUID = dataConfig.getString("player-data." + ip + ".uuid");
-            if (storedUUID != null && storedUUID.equals(playerUUID.toString())) {
-                String storedName = dataConfig.getString("player-data." + ip + ".player-name");
-                if (storedName != null) {
-                    return storedName;
-                }
-            }
-        }
-
-        // 如果数据文件中没有，尝试通过Bukkit API获取
+        // 尝试通过Bukkit API获取
         OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(playerUUID);
         if (offlinePlayer != null && offlinePlayer.getName() != null) {
             return offlinePlayer.getName();
         }
 
-        // 如果都无法获取，返回UUID的简短形式
+        // 如果无法获取，返回UUID的简短形式
         return playerUUID.toString().substring(0, 8) + "...";
     }
 
@@ -249,7 +194,7 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
         if (hours > 0) {
             sb.append(hours).append("小时");
         }
-        if (minutes > 0 || sb.length() == 0) {
+        if (minutes > 0 || sb.isEmpty()) {
             sb.append(minutes).append("分钟");
         }
 
@@ -310,10 +255,7 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
                         return true;
                     }
                     String ipToErase = args[1];
-                    if (ipCooldowns.containsKey(ipToErase)) {
-                        ipCooldowns.remove(ipToErase);
-                        dataConfig.set("player-data." + ipToErase, null);
-                        saveData();
+                    if (databaseManager.removeIPData(ipToErase)) {
                         sender.sendMessage(ChatColor.GREEN + "IP " + ipToErase + " 的限制已移除!");
                     } else {
                         sender.sendMessage(ChatColor.YELLOW + "IP " + ipToErase + " 没有限制记录");
@@ -362,7 +304,9 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
                             (config.getBoolean("enabled", true) ? ChatColor.GREEN + "已启用" : ChatColor.RED + "已禁用"));
                     sender.sendMessage(ChatColor.YELLOW + "冷却时间: " + ChatColor.AQUA +
                             config.getInt("time-limit", 10) + "分钟");
-                    sender.sendMessage(ChatColor.YELLOW + "当前限制IP数量: " + ChatColor.AQUA + ipCooldowns.size());
+                    sender.sendMessage(ChatColor.YELLOW + "存储方式: " + ChatColor.AQUA +
+                            (config.getBoolean("mysql.enabled", false) ? "MySQL" : "YAML"));
+                    sender.sendMessage(ChatColor.YELLOW + "当前限制IP数量: " + ChatColor.AQUA + databaseManager.getIPCount());
                     sender.sendMessage(ChatColor.YELLOW + "绕过IP数量: " + ChatColor.AQUA + bypassIPs.size());
                     break;
 
@@ -379,15 +323,16 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
                         }
                     } else {
                         // 显示限制IP列表
-                        sender.sendMessage(ChatColor.GOLD + "=== 受限制IP列表 ===");
-                        if (ipCooldowns.isEmpty()) {
+                        List<IPData> ipList = databaseManager.getAllIPData();
+                        sender.sendMessage(ChatColor.GOLD + "=== 受限制IP列表 (" + ipList.size() + "个) ===");
+                        if (ipList.isEmpty()) {
                             sender.sendMessage(ChatColor.YELLOW + "没有受限制的IP");
                         } else {
                             long currentTime = System.currentTimeMillis();
-                            for (Map.Entry<String, Long> entry : ipCooldowns.entrySet()) {
-                                String ip = entry.getKey();
-                                long endTime = entry.getValue();
-                                String playerName = getPlayerNameFromIP(ip);
+                            for (IPData ipData : ipList) {
+                                String ip = ipData.getIp();
+                                long endTime = ipData.getEndTime();
+                                String playerName = ipData.getPlayerName();
 
                                 if (endTime == 0) {
                                     sender.sendMessage(ChatColor.RED + "- " + ip + " (永久绑定) -> " + playerName);
@@ -408,19 +353,6 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
             return true;
         }
 
-        private String getPlayerNameFromIP(String ip) {
-            String uuidString = dataConfig.getString("player-data." + ip + ".uuid");
-            if (uuidString != null) {
-                try {
-                    UUID playerUUID = UUID.fromString(uuidString);
-                    return getPlayerName(playerUUID);
-                } catch (IllegalArgumentException e) {
-                    return "未知玩家";
-                }
-            }
-            return "未知玩家";
-        }
-
         @Override
         public List<String> onTabComplete(CommandSender sender, org.bukkit.command.Command command, String alias, String[] args) {
             List<String> completions = new ArrayList<>();
@@ -432,14 +364,19 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
                 switch (args[0].toLowerCase()) {
                     case "erase":
                         // IP地址补全
-                        StringUtil.copyPartialMatches(args[1], new ArrayList<>(ipCooldowns.keySet()), completions);
+                        List<IPData> ipList = databaseManager.getAllIPData();
+                        List<String> ipAddresses = new ArrayList<>();
+                        for (IPData ipData : ipList) {
+                            ipAddresses.add(ipData.getIp());
+                        }
+                        StringUtil.copyPartialMatches(args[1], ipAddresses, completions);
                         break;
                     case "bypass":
+                        // 无特定补全
+                        break;
                     case "unbypass":
                         // 绕过IP补全
-                        if ("unbypass".equals(args[0].toLowerCase())) {
-                            StringUtil.copyPartialMatches(args[1], new ArrayList<>(bypassIPs), completions);
-                        }
+                        StringUtil.copyPartialMatches(args[1], new ArrayList<>(bypassIPs), completions);
                         break;
                     case "timelimit":
                         // 时间建议
@@ -469,6 +406,389 @@ public class LoginIPLimit extends JavaPlugin implements Listener {
             sender.sendMessage(ChatColor.YELLOW + "/ip list - 查看受限制IP列表");
             sender.sendMessage(ChatColor.YELLOW + "/ip list bypass - 查看绕过IP列表");
             sender.sendMessage(ChatColor.YELLOW + "/ip status - 查看插件状态");
+        }
+    }
+
+    // IP数据类
+    public static class IPData {
+        private final String ip;
+        private final UUID playerUUID;
+        private final String playerName;
+        private final long endTime;
+        private final long createdAt;
+
+        public IPData(String ip, UUID playerUUID, String playerName, long endTime, long createdAt) {
+            this.ip = ip;
+            this.playerUUID = playerUUID;
+            this.playerName = playerName;
+            this.endTime = endTime;
+            this.createdAt = createdAt;
+        }
+
+        public String getIp() { return ip; }
+        public UUID getPlayerUUID() { return playerUUID; }
+        public String getPlayerName() { return playerName; }
+        public long getEndTime() { return endTime; }
+        public long getCreatedAt() { return createdAt; }
+    }
+
+    // 数据库管理类
+    public static class DatabaseManager {
+        private final LoginIPLimit plugin;
+        private Connection connection;
+        private final String tableName;
+
+        public DatabaseManager(LoginIPLimit plugin) {
+            this.plugin = plugin;
+            this.tableName = plugin.getConfig().getString("mysql.table-prefix", "iplimit_") + "data";
+        }
+
+        public boolean initialize() {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return initializeMySQL();
+            } else {
+                return initializeYAML();
+            }
+        }
+
+        private boolean initializeMySQL() {
+            try {
+                String host = plugin.getConfig().getString("mysql.host", "localhost");
+                int port = plugin.getConfig().getInt("mysql.port", 3306);
+                String database = plugin.getConfig().getString("mysql.database", "minecraft");
+                String username = plugin.getConfig().getString("mysql.username", "root");
+                String password = plugin.getConfig().getString("mysql.password", "");
+                boolean useSSL = plugin.getConfig().getBoolean("mysql.use-ssl", false);
+
+                String url = "jdbc:mysql://" + host + ":" + port + "/" + database +
+                        "?useSSL=" + useSSL + "&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=UTF-8";
+
+                connection = DriverManager.getConnection(url, username, password);
+                createTable();
+                plugin.getLogger().info("MySQL数据库连接成功!");
+                return true;
+            } catch (SQLException e) {
+                plugin.getLogger().severe("MySQL数据库连接失败: " + e.getMessage());
+                return false;
+            }
+        }
+
+        private boolean initializeYAML() {
+            // 对于YAML存储，我们不需要特殊的初始化
+            plugin.getLogger().info("使用YAML文件存储");
+            return true;
+        }
+
+        private void createTable() throws SQLException {
+            String sql = "CREATE TABLE IF NOT EXISTS " + tableName + " (" +
+                    "id INT AUTO_INCREMENT PRIMARY KEY," +
+                    "ip VARCHAR(45) NOT NULL UNIQUE," +
+                    "player_uuid VARCHAR(36) NOT NULL," +
+                    "player_name VARCHAR(16) NOT NULL," +
+                    "end_time BIGINT NOT NULL," +
+                    "created_at BIGINT NOT NULL," +
+                    "INDEX idx_ip (ip)," +
+                    "INDEX idx_end_time (end_time)" +
+                    ")";
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        public IPData getIPData(String ip) {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return getIPDataFromMySQL(ip);
+            } else {
+                return getIPDataFromYAML(ip);
+            }
+        }
+
+        private IPData getIPDataFromMySQL(String ip) {
+            String sql = "SELECT * FROM " + tableName + " WHERE ip = ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ip);
+                ResultSet resultSet = statement.executeQuery();
+                if (resultSet.next()) {
+                    UUID playerUUID = UUID.fromString(resultSet.getString("player_uuid"));
+                    String playerName = resultSet.getString("player_name");
+                    long endTime = resultSet.getLong("end_time");
+                    long createdAt = resultSet.getLong("created_at");
+                    return new IPData(ip, playerUUID, playerName, endTime, createdAt);
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("从MySQL获取IP数据失败: " + e.getMessage());
+            }
+            return null;
+        }
+
+        private IPData getIPDataFromYAML(String ip) {
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            if (!dataFile.exists()) {
+                return null;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            if (!dataConfig.contains("player-data." + ip)) {
+                return null;
+            }
+
+            String uuidString = dataConfig.getString("player-data." + ip + ".uuid");
+            String playerName = dataConfig.getString("player-data." + ip + ".player-name");
+            long endTime = dataConfig.getLong("player-data." + ip + ".end-time");
+
+            if (uuidString == null) {
+                return null;
+            }
+
+            try {
+                UUID playerUUID = UUID.fromString(uuidString);
+                return new IPData(ip, playerUUID, playerName, endTime, System.currentTimeMillis());
+            } catch (IllegalArgumentException e) {
+                plugin.getLogger().warning("无效的UUID格式: " + uuidString);
+                return null;
+            }
+        }
+
+        public boolean saveIPData(String ip, UUID playerUUID, String playerName, long endTime) {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return saveIPDataToMySQL(ip, playerUUID, playerName, endTime);
+            } else {
+                return saveIPDataToYAML(ip, playerUUID, playerName, endTime);
+            }
+        }
+
+        private boolean saveIPDataToMySQL(String ip, UUID playerUUID, String playerName, long endTime) {
+            String sql = "INSERT INTO " + tableName + " (ip, player_uuid, player_name, end_time, created_at) " +
+                    "VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
+                    "player_uuid = VALUES(player_uuid), player_name = VALUES(player_name), " +
+                    "end_time = VALUES(end_time), created_at = VALUES(created_at)";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ip);
+                statement.setString(2, playerUUID.toString());
+                statement.setString(3, playerName);
+                statement.setLong(4, endTime);
+                statement.setLong(5, System.currentTimeMillis());
+                statement.executeUpdate();
+                return true;
+            } catch (SQLException e) {
+                plugin.getLogger().severe("保存IP数据到MySQL失败: " + e.getMessage());
+                return false;
+            }
+        }
+
+        private boolean saveIPDataToYAML(String ip, UUID playerUUID, String playerName, long endTime) {
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+
+            dataConfig.set("player-data." + ip + ".uuid", playerUUID.toString());
+            dataConfig.set("player-data." + ip + ".player-name", playerName);
+            dataConfig.set("player-data." + ip + ".end-time", endTime);
+            dataConfig.set("player-data." + ip + ".created-at", System.currentTimeMillis());
+
+            try {
+                dataConfig.save(dataFile);
+                return true;
+            } catch (IOException e) {
+                plugin.getLogger().severe("保存IP数据到YAML失败: " + e.getMessage());
+                return false;
+            }
+        }
+
+        public boolean removeIPData(String ip) {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return removeIPDataFromMySQL(ip);
+            } else {
+                return removeIPDataFromYAML(ip);
+            }
+        }
+
+        private boolean removeIPDataFromMySQL(String ip) {
+            String sql = "DELETE FROM " + tableName + " WHERE ip = ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ip);
+                int affectedRows = statement.executeUpdate();
+                return affectedRows > 0;
+            } catch (SQLException e) {
+                plugin.getLogger().severe("从MySQL删除IP数据失败: " + e.getMessage());
+                return false;
+            }
+        }
+
+        private boolean removeIPDataFromYAML(String ip) {
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            if (!dataFile.exists()) {
+                return false;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            if (!dataConfig.contains("player-data." + ip)) {
+                return false;
+            }
+
+            dataConfig.set("player-data." + ip, null);
+
+            try {
+                dataConfig.save(dataFile);
+                return true;
+            } catch (IOException e) {
+                plugin.getLogger().severe("从YAML删除IP数据失败: " + e.getMessage());
+                return false;
+            }
+        }
+
+        public List<IPData> getAllIPData() {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return getAllIPDataFromMySQL();
+            } else {
+                return getAllIPDataFromYAML();
+            }
+        }
+
+        private List<IPData> getAllIPDataFromMySQL() {
+            List<IPData> ipList = new ArrayList<>();
+            String sql = "SELECT * FROM " + tableName;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                ResultSet resultSet = statement.executeQuery();
+                while (resultSet.next()) {
+                    String ip = resultSet.getString("ip");
+                    UUID playerUUID = UUID.fromString(resultSet.getString("player_uuid"));
+                    String playerName = resultSet.getString("player_name");
+                    long endTime = resultSet.getLong("end_time");
+                    long createdAt = resultSet.getLong("created_at");
+                    ipList.add(new IPData(ip, playerUUID, playerName, endTime, createdAt));
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("从MySQL获取所有IP数据失败: " + e.getMessage());
+            }
+            return ipList;
+        }
+
+        private List<IPData> getAllIPDataFromYAML() {
+            List<IPData> ipList = new ArrayList<>();
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            if (!dataFile.exists()) {
+                return ipList;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            if (!dataConfig.contains("player-data")) {
+                return ipList;
+            }
+
+            for (String ip : dataConfig.getConfigurationSection("player-data").getKeys(false)) {
+                String uuidString = dataConfig.getString("player-data." + ip + ".uuid");
+                String playerName = dataConfig.getString("player-data." + ip + ".player-name");
+                long endTime = dataConfig.getLong("player-data." + ip + ".end-time");
+
+                if (uuidString != null) {
+                    try {
+                        UUID playerUUID = UUID.fromString(uuidString);
+                        ipList.add(new IPData(ip, playerUUID, playerName, endTime, System.currentTimeMillis()));
+                    } catch (IllegalArgumentException e) {
+                        plugin.getLogger().warning("无效的UUID格式: " + uuidString);
+                    }
+                }
+            }
+            return ipList;
+        }
+
+        public int getIPCount() {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                return getIPCountFromMySQL();
+            } else {
+                return getIPCountFromYAML();
+            }
+        }
+
+        private int getIPCountFromMySQL() {
+            String sql = "SELECT COUNT(*) FROM " + tableName;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                ResultSet resultSet = statement.executeQuery();
+                if (resultSet.next()) {
+                    return resultSet.getInt(1);
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("从MySQL获取IP数量失败: " + e.getMessage());
+            }
+            return 0;
+        }
+
+        private int getIPCountFromYAML() {
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            if (!dataFile.exists()) {
+                return 0;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            if (!dataConfig.contains("player-data")) {
+                return 0;
+            }
+
+            return dataConfig.getConfigurationSection("player-data").getKeys(false).size();
+        }
+
+        public void cleanupExpiredIPs() {
+            if (plugin.getConfig().getBoolean("mysql.enabled", false)) {
+                cleanupExpiredIPsFromMySQL();
+            } else {
+                cleanupExpiredIPsFromYAML();
+            }
+        }
+
+        private void cleanupExpiredIPsFromMySQL() {
+            long currentTime = System.currentTimeMillis();
+            String sql = "DELETE FROM " + tableName + " WHERE end_time > 0 AND end_time <= ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setLong(1, currentTime);
+                int deleted = statement.executeUpdate();
+                if (deleted > 0) {
+                    plugin.getLogger().info("清理了 " + deleted + " 个过期的IP记录");
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().severe("清理MySQL过期IP记录失败: " + e.getMessage());
+            }
+        }
+
+        private void cleanupExpiredIPsFromYAML() {
+            File dataFile = new File(plugin.getDataFolder(), "data.yml");
+            if (!dataFile.exists()) {
+                return;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            if (!dataConfig.contains("player-data")) {
+                return;
+            }
+
+            long currentTime = System.currentTimeMillis();
+            int cleaned = 0;
+
+            for (String ip : dataConfig.getConfigurationSection("player-data").getKeys(false)) {
+                long endTime = dataConfig.getLong("player-data." + ip + ".end-time");
+                if (endTime > 0 && endTime <= currentTime) {
+                    dataConfig.set("player-data." + ip, null);
+                    cleaned++;
+                }
+            }
+
+            if (cleaned > 0) {
+                try {
+                    dataConfig.save(dataFile);
+                    plugin.getLogger().info("清理了 " + cleaned + " 个过期的IP记录");
+                } catch (IOException e) {
+                    plugin.getLogger().severe("保存清理后的YAML数据失败: " + e.getMessage());
+                }
+            }
+        }
+
+        public void close() {
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (SQLException e) {
+                    plugin.getLogger().severe("关闭数据库连接失败: " + e.getMessage());
+                }
+            }
         }
     }
 }

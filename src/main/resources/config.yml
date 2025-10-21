@@ -10,3 +10,17 @@ time-limit: 1440
 bypass-ips:
   - "127.0.0.1"
   - "localhost"
+
+# MySQL数据库配置
+mysql:
+  # 是否启用MySQL存储 (启用后将在群组服间共享数据)
+  enabled: false
+  host: "localhost"
+  port: 3306
+  database: "minecraft"
+  username: "root"
+  password: ""
+  # 表前缀
+  table-prefix: "iplimit_"
+  # 是否使用SSL连接
+  use-ssl: false

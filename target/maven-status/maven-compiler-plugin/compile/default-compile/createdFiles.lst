@@ -1,2 +1,4 @@
-ljsure\cn\LoginIPLimit$IPCommand.class
+ljsure\cn\LoginIPLimit$IPData.class
 ljsure\cn\LoginIPLimit.class
+ljsure\cn\LoginIPLimit$DatabaseManager.class
+ljsure\cn\LoginIPLimit$IPCommand.class
